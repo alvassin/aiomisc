@@ -1,6 +1,7 @@
 import asyncio
 import os
 import pickle
+import signal
 import socket
 import uuid
 from asyncio import Event, get_event_loop
@@ -867,6 +868,56 @@ def readiness_wait_task(service: aiomisc.Service) -> Task[bool]:
     )
 
 
+@pytest.mark.parametrize("cleanup_fails", (False, True))
+def test_pre_start_failure_runs_post_stop_and_closes_loop(cleanup_fails):
+    ep = Entrypoint(log_config=False, catch_signals=())
+    loop = ep.loop
+    error = RuntimeError("startup failed")
+    events = []
+
+    async def pre_start(**kwargs):
+        events.append("pre_start")
+        raise error
+
+    async def post_stop(**kwargs):
+        events.append("post_stop")
+        if cleanup_fails:
+            raise ValueError("cleanup failed")
+
+    ep.pre_start.connect(pre_start)
+    ep.post_stop.connect(post_stop)
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            with ep:
+                pytest.fail("entered after startup failed")
+        assert raised.value is error
+        assert events == ["pre_start", "post_stop"]
+        assert loop.is_closed()
+    finally:
+        if not loop.is_closed():
+            loop.close()
+
+
+async def test_pre_start_failure_on_external_loop(event_loop):
+    ep = Entrypoint(
+        loop=event_loop, catch_signals=(signal.SIGTERM,), log_config=False
+    )
+
+    async def fail(**kwargs):
+        raise RuntimeError("startup failed")
+
+    ep.pre_start.connect(fail)
+    with mock.patch("signal.signal") as set_handler:
+        with pytest.raises(RuntimeError, match="startup failed"):
+            async with ep:
+                pytest.fail("entered after startup failed")
+
+    set_handler.assert_not_called()
+    with pytest.raises(KeyError):
+        aiomisc.get_context(event_loop)
+    assert not event_loop.is_closed()
+
+
 @pytest.mark.parametrize("peer_count", (1, 3))
 async def test_failed_startup_joins_peer_starts_before_post_start_and_stop(
     event_loop, peer_count
@@ -925,7 +976,6 @@ async def test_failed_startup_joins_peer_starts_before_post_start_and_stop(
         assert all(peer.start_task.cancelled() for peer in peers)
         assert all(waiter.cancelled() for waiter in waiters)
         assert not unrelated.done()
-        await ep.__aexit__(None, None, None)
         release.set()
         await asyncio.sleep(0)
         assert stopped == set(peers) and not late
@@ -975,7 +1025,6 @@ async def test_peer_failure_cleanup_survives_repeated_startup_cancellation(
             await asyncio.wait_for(startup, timeout=1)
         assert raised.value is boom
         assert slow.start_task.cancelled()
-        await ep.__aexit__(None, None, None)
 
 
 async def test_cancelled_startup_before_ready_joins_owned_tasks(event_loop):
@@ -1008,9 +1057,8 @@ async def test_cancelled_startup_before_ready_joins_owned_tasks(event_loop):
         tasks.extend((service.start_task, waiter))
 
         startup.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as raised:
             await asyncio.wait_for(startup, timeout=1)
-        await asyncio.wait_for(ep.__aexit__(None, None, None), timeout=1)
 
         assert (
             service.start_task.cancelled(),
@@ -1020,7 +1068,7 @@ async def test_cancelled_startup_before_ready_joins_owned_tasks(event_loop):
             stopped,
             ep.services,
             event_loop.is_closed(),
-        ) == (True, True, True, False, [None], (), False)
+        ) == (True, True, True, False, [raised.value], (), False)
 
 
 @pytest.mark.parametrize("first", ("ready", "cancel"))
@@ -1061,7 +1109,6 @@ async def test_readiness_racing_startup_cancellation_joins_start_task(
         action_two()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(startup, timeout=1)
-        await asyncio.wait_for(ep.__aexit__(None, None, None), timeout=1)
 
         assert (
             service.start_task.cancelled(),
@@ -1106,7 +1153,6 @@ async def test_startup_exception_racing_cancellation_joins_readiness_waiter(
         startup.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(startup, timeout=1)
-        await asyncio.wait_for(ep.__aexit__(None, None, None), timeout=1)
 
         assert (
             service.start_task.done(),
@@ -1186,9 +1232,6 @@ async def test_startup_exception_before_readiness_propagates(event_loop):
         release.set()
         with pytest.raises(RuntimeError) as raised:
             await asyncio.wait_for(startup, timeout=1)
-        await asyncio.wait_for(
-            ep.__aexit__(RuntimeError, error, None), timeout=1
-        )
 
         assert (
             raised.value is error,

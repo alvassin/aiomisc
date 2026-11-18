@@ -2,11 +2,13 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 import threading
 from concurrent.futures import Executor
+from contextlib import contextmanager
 from functools import cached_property
 from typing import Any, TypeVar
-from collections.abc import Callable, Coroutine, Iterable, MutableSet
+from collections.abc import Callable, Coroutine, Iterable, Iterator, MutableSet
 from weakref import WeakSet
 
 import aiomisc_log
@@ -47,24 +49,38 @@ def _get_env_convert(name: str, converter: Callable[..., T], default: T) -> T:
     return converter(value)
 
 
+@contextmanager
+def _log_rollback_errors() -> Iterator[None]:
+    try:
+        yield
+    except BaseException:
+        log.exception("Failed to clean up after entrypoint startup failed")
+
+
 class OSSignalHandler:
     def __init__(self, sig: int, handler: Callable[[int], None]):
         self.default_handler = signal.getsignal(sig)
         self.signal = sig
         self.handler = handler
+        self._applied = False
 
     def __callback(self, *_: Any) -> None:
         self.handler(self.signal)
 
     def apply(self) -> None:
         signal.signal(self.signal, self.__callback)
+        self._applied = True
 
     def restore(self) -> None:
-        signal.signal(self.signal, self.default_handler)
+        if self._applied:
+            signal.signal(self.signal, self.default_handler)
+            self._applied = False
 
 
 @final
 class Entrypoint:
+    ctx: Context | None
+
     DEFAULT_LOG_LEVEL: str = os.getenv("AIOMISC_LOG_LEVEL", LogLevel.default())
     DEFAULT_LOG_FORMAT: str = os.getenv(
         "AIOMISC_LOG_FORMAT", LogFormat.default()
@@ -99,6 +115,7 @@ class Entrypoint:
         return CURRENT_ENTRYPOINT.get()
 
     async def _start(self) -> None:
+        self.ctx = Context(loop=self.loop)
         if self.log_config:
             basic_config(
                 level=self.log_level,
@@ -188,7 +205,7 @@ class Entrypoint:
 
         self.catch_signals = catch_signals
         self.shutdown_timeout = float(shutdown_timeout)
-        self.ctx: Context | None = None
+        self.ctx = None
         self.log_buffer_size = log_buffer_size
         self.log_buffering = log_buffering
         self.log_config = log_config
@@ -265,8 +282,14 @@ class Entrypoint:
             self._runner = None
 
     def __enter__(self) -> asyncio.AbstractEventLoop:
-        self.loop.run_until_complete(self.__aenter__())
-        return self.loop
+        loop = self.loop
+        try:
+            loop.run_until_complete(self._start())
+        except BaseException:
+            with _log_rollback_errors():
+                self.__exit__(*sys.exc_info())
+            raise
+        return loop
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         loop = self.loop
@@ -281,21 +304,24 @@ class Entrypoint:
                 buffered=False,
             )
 
-        loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))
-
-        if self._loop_owner and self._runner is not None:
-            # Runner.close() handles shutdown_asyncgens,
-            # shutdown_default_executor, and loop.close()
-            self._runner.close()
-            self._runner = None
+        try:
+            loop.run_until_complete(self.__aexit__(exc_type, exc_val, exc_tb))
+        finally:
+            if self._loop_owner and self._runner is not None:
+                self._runner.close()
+                self._runner = None
 
     async def __aenter__(self) -> "Entrypoint":
         if self._loop is None:
             # When __aenter__ called without __enter__
             self._loop = asyncio.get_running_loop()
 
-        self.ctx = Context(loop=self.loop)
-        await self._start()
+        try:
+            await self._start()
+        except BaseException:
+            with _log_rollback_errors():
+                await self.__aexit__(*sys.exc_info())
+            raise
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
